@@ -1,0 +1,317 @@
+from flask import Flask, render_template_string, request, redirect, url_for, session
+import sqlite3
+import json
+from datetime import datetime, timedelta
+
+app = Flask(__name__)
+app.secret_key = 'motosg1105_ultra_v7_fixed'
+
+# --- BASE DE DATOS ---
+def get_db():
+    conn = sqlite3.connect('appnon.db')
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_db()
+    conn.execute('''CREATE TABLE IF NOT EXISTS articulos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, nombre TEXT, 
+        precio_venta REAL, precio_costo REAL, stock INTEGER, imagen TEXT)''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS ventas (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, monto REAL, ganancia REAL, fecha TEXT)''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS gastos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, concepto TEXT, monto REAL, fecha TEXT)''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS config (id INTEGER PRIMARY KEY, whatsapp TEXT)''')
+    if not conn.execute('SELECT * FROM config').fetchone():
+        conn.execute('INSERT INTO config (whatsapp) VALUES ("528130389652")')
+    conn.commit()
+    conn.close()
+
+# --- DISEÑO UI ---
+HTML_LAYOUT = """
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Rajdhani:wght@600;700&display=swap');
+        body { background-color: #000; color: #fff; font-family: 'Rajdhani', sans-serif; }
+        .neon-text { color: #00ff41; text-shadow: 0 0 10px #00ff41; }
+        .nav-pills .nav-link { color: #aaa; border: 1px solid #222; margin: 5px; font-weight: bold; }
+        .nav-pills .nav-link.active { background-color: #00ff41 !important; color: #000; border-color: #00ff41; }
+        .card-custom { background: #0a0a0a; border: 1px solid #1a1a1a; border-radius: 15px; padding: 20px; margin-bottom: 20px; }
+        .stats-box { background: #111; padding: 15px; border-radius: 10px; border-left: 3px solid #00ff41; height: 100%; }
+        .form-control { background: #111; border: 1px solid #333; color: white; padding: 12px; }
+        .btn-neon { background: #00ff41; color: #000; font-weight: bold; border: none; padding: 15px; width: 100%; border-radius: 10px; }
+        .img-preview { height: 180px; object-fit: cover; border-radius: 10px; width: 100%; margin-bottom: 10px; }
+        .badge-stock { position: absolute; top: 10px; right: 10px; background: #00ff41; color: #000; padding: 5px 10px; border-radius: 5px; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <nav class="navbar border-bottom border-success p-3 mb-3 sticky-top" style="background: black;">
+        <div class="container d-flex justify-content-between">
+            <h2 class="neon-text m-0">MOTOS G1105</h2>
+            <div>
+                <a href="/" class="btn btn-sm btn-outline-light">TIENDA</a>
+                <a href="/admin" class="btn btn-sm btn-outline-success">ADMIN</a>
+            </div>
+        </div>
+    </nav>
+    <div class="container">
+        {% block content %}{% endblock %}
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def index():
+    conn = get_db()
+    motos = conn.execute('SELECT * FROM articulos WHERE stock > 0').fetchall()
+    ws = conn.execute('SELECT whatsapp FROM config').fetchone()[0]
+    conn.close()
+    
+    motos_list = ""
+    for moto in motos:
+        motos_list += f"""
+        <div class="col-12 col-md-6 col-lg-4">
+            <div class="card-custom text-center position-relative">
+                <span class="badge-stock">Stock: {moto['stock']}</span>
+                <img src="{moto['imagen']}" class="img-preview">
+                <h3>{moto['nombre']}</h3>
+                <h2 class="neon-text">${moto['precio_venta']:,.0f}</h2>
+                <a href="https://wa.me/{ws}?text=Me interesa la moto: {moto['nombre']}" target="_blank" class="btn btn-neon">CONTACTAR POR WHATSAPP</a>
+            </div>
+        </div>"""
+        
+    content = f'<div class="row g-3">{motos_list}</div>'
+    return render_template_string(HTML_LAYOUT.replace('{% block content %}{% endblock %}', content))
+
+@app.route('/admin')
+def admin():
+    if not session.get('admin'):
+        return render_template_string(HTML_LAYOUT.replace('{% block content %}{% endblock %}', """
+        <div class="row justify-content-center mt-5">
+            <div class="col-11 col-md-5 card-custom p-5">
+                <h2 class="text-center neon-text mb-4">ACCESO PANEL</h2>
+                <form action="/login" method="POST">
+                    <input type="password" name="pass" class="form-control mb-4 text-center" placeholder="CONTRASEÑA" style="font-size: 2rem;">
+                    <button class="btn btn-neon">ENTRAR</button>
+                </form>
+            </div>
+        </div>
+        """))
+
+    conn = get_db()
+    motos = conn.execute('SELECT * FROM articulos').fetchall()
+    gastos = conn.execute('SELECT * FROM gastos ORDER BY id DESC LIMIT 10').fetchall()
+    ws = conn.execute('SELECT whatsapp FROM config').fetchone()[0]
+
+    inv_total = conn.execute("SELECT SUM(precio_costo * stock) FROM articulos").fetchone()[0] or 0
+    cap_liquido = conn.execute("SELECT SUM(monto) FROM ventas").fetchone()[0] or 0
+    gan_bruta = conn.execute("SELECT SUM(ganancia) FROM ventas").fetchone()[0] or 0
+    total_gastos = conn.execute("SELECT SUM(monto) FROM gastos").fetchone()[0] or 0
+    gan_neta = gan_bruta - total_gastos
+
+    # --- DATOS GRÁFICA ---
+    labels, valores = [], []
+    hoy = datetime.now()
+    for i in range(6, -1, -1):
+        dia = hoy - timedelta(days=i)
+        labels.append(dia.strftime('%a'))
+        v = conn.execute("SELECT SUM(monto) FROM ventas WHERE fecha LIKE ?", (f"{dia.strftime('%Y-%m-%d')}%",)).fetchone()[0]
+        valores.append(v if v else 0)
+    conn.close()
+
+    # --- CONSTRUCCIÓN DE LISTAS PARA EVITAR ERRORES DE JINJA ---
+    motos_html = ""
+    for m in motos:
+        m_json = json.dumps(dict(m))
+        motos_html += f"""
+        <div class="col-12">
+            <div class="card-custom d-flex justify-content-between align-items-center p-3">
+                <div>
+                    <b class="text-success h5">{m['nombre']}</b><br>
+                    <small>Stock: {m['stock']} | Venta: ${m['precio_venta']:,.0f} | Costo: ${m['precio_costo']:,.0f}</small>
+                </div>
+                <div class="d-flex gap-2">
+                    <a href="/marcar_vendido/{m['id']}" class="btn btn-success">✅</a>
+                    <button class="btn btn-warning" onclick='editMoto({m_json})'>✏️</button>
+                    <a href="/eliminar_moto/{m['id']}" class="btn btn-danger" onclick="return confirm('¿Borrar {m['nombre']}?')">🗑️</a>
+                </div>
+            </div>
+        </div>"""
+
+    gastos_html = "".join([f"<tr><td>{g['fecha']}</td><td>{g['concepto']}</td><td class='text-danger'>-${g['monto']:,.0f}</td></tr>" for g in gastos])
+
+    content = f"""
+    <ul class="nav nav-pills mb-4 justify-content-center">
+        <li class="nav-item"><button class="nav-link active" onclick="showTab('stats')">📊 DINERO</button></li>
+        <li class="nav-item"><button class="nav-link" onclick="showTab('inv')">🏍️ MOTOS</button></li>
+        <li class="nav-item"><button class="nav-link" onclick="showTab('gastos')">💸 GASTOS</button></li>
+    </ul>
+
+    <div id="tab-stats" class="admin-content">
+        <div class="row g-3">
+            <div class="col-12"><div class="card-custom"><canvas id="graficaMain"></canvas></div></div>
+            <div class="col-6"><div class="stats-box"><small>CAP. LÍQUIDO</small><br><span class="neon-text h4">${cap_liquido:,.0f}</span></div></div>
+            <div class="col-6"><div class="stats-box"><small>GANANCIA NETA</small><br><span class="text-white h4">${gan_neta:,.0f}</span></div></div>
+            <div class="col-6"><div class="stats-box text-warning"><small>INV. EN STOCK</small><br><span class="h4">${inv_total:,.0f}</span></div></div>
+            <div class="col-6"><div class="stats-box"><small>GASTOS TOTALES</small><br><span class="text-danger h4">-${total_gastos:,.0f}</span></div></div>
+        </div>
+        <div class="card-custom mt-3">
+            <h5>TELÉFONO WHATSAPP:</h5>
+            <form action="/update_ws" method="POST" class="d-flex"><input name="ws" class="form-control me-2" value="{ws}"><button class="btn btn-success">GUARDAR</button></form>
+        </div>
+    </div>
+
+    <div id="tab-inv" class="admin-content d-none">
+        <button class="btn btn-primary w-100 mb-3 p-3" onclick="openMotoModal()">+ AGREGAR NUEVA MOTO</button>
+        <div class="row g-2">{motos_html}</div>
+    </div>
+
+    <div id="tab-gastos" class="admin-content d-none">
+        <div class="card-custom">
+            <h4>NUEVO GASTO OPERATIVO</h4>
+            <form action="/add_gasto" method="POST">
+                <input name="concepto" placeholder="Luz, Renta, Gasolina..." class="form-control mb-2" required>
+                <input name="monto" type="number" placeholder="Monto $" class="form-control mb-2" required>
+                <button class="btn btn-danger w-100">REGISTRAR GASTO</button>
+            </form>
+        </div>
+        <div class="table-responsive mt-3"><table class="table table-dark">
+            <thead><tr><th>FECHA</th><th>CONCEPTO</th><th>MONTO</th></tr></thead>
+            <tbody>{gastos_html}</tbody>
+        </table></div>
+    </div>
+
+    <div class="modal fade" id="motoModal" tabindex="-1" aria-hidden="true">
+      <div class="modal-dialog"><div class="modal-content bg-dark border-success">
+        <form id="motoForm" action="/agregar_moto" method="POST" class="modal-body p-4">
+            <h4 class="neon-text mb-3" id="mTitle">DATOS DE LA MOTO</h4>
+            <input type="hidden" name="id" id="mId">
+            <input name="nombre" id="mNombre" placeholder="Nombre de la Moto" class="form-control mb-2" required>
+            <input name="precio_venta" id="mVenta" placeholder="Precio Venta" class="form-control mb-2" type="number" step="any" required>
+            <input name="precio_costo" id="mCosto" placeholder="Precio Costo (Tu inversion)" class="form-control mb-2" type="number" step="any" required>
+            <input name="stock" id="mStock" placeholder="Stock Cantidad" class="form-control mb-2" type="number" required>
+            <input name="imagen" id="mImagen" placeholder="Link de la Foto" class="form-control mb-3" required>
+            <button type="submit" class="btn btn-neon">GUARDAR CAMBIOS</button>
+        </form>
+      </div></div>
+    </div>
+
+    <script>
+    function showTab(tabId) {{
+        document.querySelectorAll('.admin-content').forEach(el => el.classList.add('d-none'));
+        document.querySelectorAll('.nav-link').forEach(el => el.classList.remove('active'));
+        document.getElementById('tab-' + tabId).classList.remove('d-none');
+        if(event) event.target.classList.add('active');
+    }}
+    function openMotoModal() {{
+        document.getElementById('motoForm').action = '/agregar_moto';
+        document.getElementById('mTitle').innerText = 'NUEVA MOTO';
+        document.getElementById('motoForm').reset();
+        new bootstrap.Modal(document.getElementById('motoModal')).show();
+    }}
+    function editMoto(moto) {{
+        document.getElementById('motoForm').action = '/editar_moto';
+        document.getElementById('mTitle').innerText = 'EDITAR PRODUCTO';
+        document.getElementById('mId').value = moto.id;
+        document.getElementById('mNombre').value = moto.nombre;
+        document.getElementById('mVenta').value = moto.precio_venta;
+        document.getElementById('mCosto').value = moto.precio_costo;
+        document.getElementById('mStock').value = moto.stock;
+        document.getElementById('mImagen').value = moto.imagen;
+        new bootstrap.Modal(document.getElementById('motoModal')).show();
+    }}
+    new Chart(document.getElementById('graficaMain'), {{
+        type: 'line',
+        data: {{ labels: {labels}, datasets: [{{ label: 'Ventas $', data: {valores}, borderColor: '#00ff41', tension: 0.3, fill: true, backgroundColor: 'rgba(0, 255, 65, 0.1)' }}] }},
+        options: {{ 
+            responsive: true, 
+            scales: {{ 
+                y: {{ 
+                    beginAtZero: true,
+                    ticks: {{ 
+                        callback: function(value) {{ return '$' + value.toLocaleString(); }},
+                        color: '#aaa' 
+                    }}
+                }},
+                x: {{ ticks: {{ color: '#aaa' }} }}
+            }},
+            plugins: {{ legend: {{ display: false }} }} 
+        }}
+    }});
+    </script>
+    """
+    return render_template_string(HTML_LAYOUT.replace('{% block content %}{% endblock %}', content))
+
+# --- RUTAS DE ACCIÓN ---
+@app.route('/login', methods=['POST'])
+def login():
+    if request.form.get('pass') == '1234':
+        session['admin'] = True
+    return redirect(url_for('admin'))
+
+@app.route('/agregar_moto', methods=['POST'])
+def add_moto():
+    conn = get_db()
+    conn.execute('INSERT INTO articulos (nombre, precio_venta, precio_costo, stock, imagen) VALUES (?,?,?,?,?)',
+                 (request.form['nombre'], request.form['precio_venta'], request.form['precio_costo'], request.form['stock'], request.form['imagen']))
+    conn.commit()
+    conn.close()
+    return redirect(url_for('admin'))
+
+@app.route('/editar_moto', methods=['POST'])
+def edit_moto():
+    conn = get_db()
+    conn.execute('UPDATE articulos SET nombre=?, precio_venta=?, precio_costo=?, stock=?, imagen=? WHERE id=?',
+                 (request.form['nombre'], request.form['precio_venta'], request.form['precio_costo'], request.form['stock'], request.form['imagen'], request.form['id']))
+    conn.commit()
+    conn.close()
+    return redirect(url_for('admin'))
+
+@app.route('/eliminar_moto/<int:id>')
+def del_moto(id):
+    conn = get_db()
+    conn.execute('DELETE FROM articulos WHERE id = ?', (id,))
+    conn.commit()
+    conn.close()
+    return redirect(url_for('admin'))
+
+@app.route('/marcar_vendido/<int:id>')
+def vender(id):
+    conn = get_db()
+    moto = conn.execute('SELECT * FROM articulos WHERE id = ?', (id,)).fetchone()
+    if moto and moto['stock'] > 0:
+        ganancia = moto['precio_venta'] - moto['precio_costo']
+        conn.execute('INSERT INTO ventas (monto, ganancia, fecha) VALUES (?,?,?)', (moto['precio_venta'], ganancia, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+        conn.execute('UPDATE articulos SET stock = stock - 1 WHERE id = ?', (id,))
+        conn.commit()
+    conn.close()
+    return redirect(url_for('admin'))
+
+@app.route('/add_gasto', methods=['POST'])
+def add_gasto():
+    conn = get_db()
+    conn.execute('INSERT INTO gastos (concepto, monto, fecha) VALUES (?,?,?)', (request.form['concepto'], request.form['monto'], datetime.now().strftime('%Y-%m-%d')))
+    conn.commit()
+    conn.close()
+    return redirect(url_for('admin'))
+
+@app.route('/update_ws', methods=['POST'])
+def update_ws():
+    conn = get_db()
+    conn.execute('UPDATE config SET whatsapp = ? WHERE id = 1', (request.form['ws'],))
+    conn.commit()
+    conn.close()
+    return redirect(url_for('admin'))
+
+if __name__ == '__main__':
+    init_db()
+    app.run(host='0.0.0.0', port=5000)
+    
